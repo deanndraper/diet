@@ -24,10 +24,6 @@ var/
 venv/
 ENV/
 
-# Database
-*.db
-*.sqlite3
-
 # Environment variables
 .env
 
