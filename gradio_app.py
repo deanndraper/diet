@@ -1,5 +1,5 @@
 import gradio as gr
-from diet import get_meal_info, get_calorie_summary, process_user_message, format_response, get_recent_chat, build_chat_history_block
+from diet import FullResponse, process_image, get_meal_info, get_calorie_summary,process_user_message, format_response, get_recent_chat, build_chat_history_block
 import json
 from datetime import datetime
 # Default user and application IDs
@@ -15,9 +15,40 @@ def get_chat_history():
 
 def respond(message, chat_history):
     """Process the user's message and return the response"""
-    response = process_user_message(message, DEFAULT_USER_ID, DEFAULT_APPLICATION_ID)
+    text = message.get("text", "")
+    files = message.get("files", [])
+    
+    foods_from_picture_json = None
+    # Process any uploaded images
+    if files:
+        for file in files:
+            # Display the image in the chat
+            chat_history.append((gr.Image(value=file), None))
+            
+            # Process the image and get the analysis
+            image_analysis = process_image(file)
+            
+            if "error" in image_analysis:
+                chat_history.append((None, f"Error processing image: {image_analysis['error']}"))
+            else:
+                # Format the food items into a table
+                if image_analysis.food_items:
+                    table = "| Food Item | Quantity | Unit | Meal Type |\n"
+                    table += "|-----------|----------|------|------------|\n"
+                    for item in image_analysis.food_items:
+                        table += f"| {item.name} | {item.quantity} | {item.unit} | {item.meal_type} |\n"
+                    chat_history.append((None, f"I found these items in the image:\n\n{table}"))
+                    foods_from_picture_json = json.dumps([item.model_dump() for item in image_analysis.food_items], indent=2)
+                # Add any additional notes
+                if image_analysis.response:
+                    chat_history.append((None, f"{image_analysis.response}"))
+    
+    # Process the text message if any
+
+    response = process_user_message(text, foods_from_picture_json, DEFAULT_USER_ID, DEFAULT_APPLICATION_ID)
     formatted_response = format_response(response)
-    chat_history.append((message, formatted_response))
+    chat_history.append((text, formatted_response))
+    
     dashboard_text = update_dashboard()
     return "", chat_history, dashboard_text
 
@@ -71,14 +102,16 @@ with gr.Blocks(css=custom_css, title="Diet Assistant 🥗", theme=gr.themes.Soft
             chatbot = gr.Chatbot(
                 value=get_chat_history(),
                 height=500,
-                show_copy_button=True
+                show_copy_button=False
             )
             with gr.Row():
-                msg = gr.Textbox(
-                    placeholder="What did you eat today?",
+                msg = gr.MultimodalTextbox(
+                    placeholder="What did you eat today? Upload food pictures!",
                     show_label=False,
                     container=False,
-                    scale=9
+                    scale=9,
+                    file_types=["image"],
+                    file_count="multiple"
                 )
                 submit = gr.Button("Send", variant="primary", scale=1)
         
