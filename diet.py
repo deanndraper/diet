@@ -8,10 +8,102 @@ from openai import OpenAI, OpenAIError
 import os
 from dotenv import load_dotenv  
 import base64
+from langchain_openai import ChatOpenAI
+from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.output_parsers import PydanticOutputParser
+from langchain_core.runnables.history import RunnableWithMessageHistory
+from memory import DietMemory
+import logging
 
 load_dotenv()
+
+# --- Configure Logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
  
+# --- Pydantic Models ---
+class FoodItem(BaseModel):
+    name: str
+    quantity: float
+    unit: str = Field(..., description="""
+    A unit of measurement for the food item or the word 'item' if it is not a measurable quantity.
+    Examples: 'oz', 'g', 'ml', 'item', 'tbsp', 'tsp', 'cup', 'pinch', 'can', 'pkg', 'lb', 'oz', 'lb', 'item'. 
+    Example: if three eggs is the message, the quantiy will be 3 and the unit will be 'item'""")
+
+    total_calories: float
+    meal_type: Literal['breakfast', 'lunch', 'dinner', 'snack', 'unspecified']
+
+class LLMResponsePicture(BaseModel):
+    food_items: List[FoodItem] = Field(..., description="""
+    A list of food items consumed by the user in the provided image, if none, return an empty list. 
+    If you are confused ask for clarification in your response.""")
+
+    response: Optional[str] = Field(None, description="Only if you need clarification.")
+
+class LLMResponseText(BaseModel):
+    food_items: List[FoodItem] = Field(..., description="""
+    A list of food items consumed by the user in the current message, if none, return an empty list.
+    Only include food items that are mentioned in the user's message that they ate.  
+    Do not include food items that are suggestions or recommendations.  If you are confused ask for clarification in your response.""")
+
+    response: Optional[str] = Field(None, description="A response to the user's message")
+
+class FullResponse(LLMResponseText):
+    user_message_id:Optional[int] = Field(None, description="The ID of the user's message")
+    assistant_message_id:Optional[int] = Field(None, description="The ID of the assistant's message")
+    error_message: Optional[str] = Field(None, description="An error message to the user if the response is not valid") 
+
+
+# Initialize both OpenAI client (for vision) and LangChain chat model
 openai_client = OpenAI()
+chat_model = ChatOpenAI(
+    model="gpt-4o-mini",
+    temperature=0.7
+)
+
+# Create output parser for our LLMResponseText model
+response_parser = PydanticOutputParser(pydantic_object=LLMResponseText)
+
+# Create prompt template
+text_prompt_template = ChatPromptTemplate.from_messages([
+    ("system", """You are a helpful dietary assistant integrated into a chatbot on a website. 
+    Your role is to track the user's food intake and ensure they stay on target to meet their daily calorie goal.
+    
+    You will receive a message from the user. This message may:
+    - Mention food they've eaten.
+    - Ask to adjust calories consumed (e.g., to correct an earlier entry).
+    - Include conversational elements or questions.
+    
+    Your tasks:
+    1. If the message contains food items, extract them and return a JSON object describing each one.
+    2. If the message is an adjustment, return a food item with **negative calories** to reflect the correction.
+    3. Respond with a conversational reply **only if appropriate**, but keep it minimal or omit it entirely if the message is strictly functional.
+    4. If you see a trend in the eating that could be a problem, respond with a subtile warning and add some humor if possible.
+    5. Use **a few well-placed emojis** to make the response friendly and engaging — but keep it subtle.
+    6. If the user is eating a lot of calories, ask them what is going on.  Are they not sleeping?  Under a lot of stress? Change in medication? If they provide a resson, let them know you recored it and will look for a trend on the montly review.
+    
+    {format_instructions}
+    """),
+    MessagesPlaceholder(variable_name="chat_history"),
+    ("human", """
+    ### Foods Already Consumed Today
+    <foods_already_consumed>
+    {foods_consumed}
+    </foods_already_consumed>
+
+    ### 💬 Latest Message from the User
+    <latest_message>
+    {input}
+    </latest_message>
+
+    ### 👤 User Profile
+    <user_information>
+        <restrictions>{restrictions}</restrictions>
+        <daily_calorie_goal>{goal}</daily_calorie_goal>
+        <calories_already_consumed_today>{consumed_calories}</calories_already_consumed_today>
+    </user_information>
+    """)
+])
 
 # --- Database Implementation for SQLite ---
 class db:
@@ -62,76 +154,8 @@ class db:
         row = cur.fetchone()
         return dict(row) if row else {}
 
-# --- Pydantic Models ---
-class FoodItem(BaseModel):
-    name: str
-    quantity: float
-    unit: str = Field(..., description="""
-    A unit of measurement for the food item or the word 'item' if it is not a measurable quantity.
-    Examples: 'oz', 'g', 'ml', 'item', 'tbsp', 'tsp', 'cup', 'pinch', 'can', 'pkg', 'lb', 'oz', 'lb', 'item'. 
-    Example: if three eggs is the message, the quantiy will be 3 and the unit will be 'item'""")
 
-    total_calories: float
-    meal_type: Literal['breakfast', 'lunch', 'dinner', 'snack', 'unspecified']
-
-class LLMResponsePicture(BaseModel):
-    food_items: List[FoodItem] = Field(..., description="""
-    A list of food items consumed by the user in the provided image, if none, return an empty list. 
-    If you are confused ask for clarification in your response.""")
-
-    response: Optional[str] = Field(None, description="Only if you need clarification.")
-
-class LLMResponseText(BaseModel):
-    food_items: List[FoodItem] = Field(..., description="""
-    A list of food items consumed by the user in the current message, if none, return an empty list.
-    Only include food items that are mentioned in the user's message that they ate.  
-    Do not include food items that are suggestions or recommendations.  If you are confused ask for clarification in your response.""")
-
-    response: Optional[str] = Field(None, description="A response to the user's message")
-
-class FullResponse(LLMResponseText):
-    user_message_id:Optional[int] = Field(None, description="The ID of the user's message")
-    assistant_message_id:Optional[int] = Field(None, description="The ID of the assistant's message")
-    error_message: Optional[str] = Field(None, description="An error message to the user if the response is not valid") 
-
-class Message(BaseModel):
-    role: str
-    timestamp: datetime
-    message: str
-    id: int
 # --- Utility Functions ---
-def get_recent_chat(user_id, application_id, limit=10):
-    since = (datetime.now(UTC) - timedelta(days=2)).isoformat()
-    messages = db.query("""
-        SELECT role, content, timestamp, id FROM messages
-        WHERE user_id = ?
-          AND application_id = ?
-          AND timestamp >= ?
-        ORDER BY timestamp DESC
-        LIMIT ?
-    """, (user_id, application_id, since, limit))
-    return list(reversed(messages))
-
-def build_chat_history_block(messages):
-    """Build a chat history block for the chat history.
-    
-    Args:
-        messages: A list of messages
-        
-    Returns:
-        A JSON string containing the chat history"""
-    
-    message_list = []
-    for msg in messages:
-        m = Message(
-            role=  msg["role"],
-            timestamp=msg.get("timestamp", datetime.now(UTC)),
-            message=msg["content"],
-            id=msg["id"]
-        )
-        message_list.append(m)
-    return json.dumps([m.model_dump() for m in message_list], default=str)
-
 def extract_json_block(text):
     """Extract a JSON block from the text returned by the LLM.
     
@@ -244,35 +268,28 @@ Return **only** a JSON object that matches the following schema, enclosed in tri
 """
 
 
-def store_interaction(user_id: str, application_id: str, content: str, response: LLMResponseText) -> dict:
+def store_interaction(user_id: str, application_id: str, response: LLMResponseText) -> dict:
     """Store the user interaction and any food items in the database.
     
     Args:
         user_id: The ID of the user
         application_id: The ID of the application
-        content: The original user message
         response: The validated LLMResponse containing the assistant's response and food items
     """
-    # Store the conversation messages
-    user_message_id = add_message(user_id, application_id, content, "user")
-    
-    assistant_message_id = None
-    if response.response:
-        assistant_message_id = add_message(user_id, application_id, response.response, "assistant")
-    
     # Store any food items mentioned
-    for item in response.food_items:
-        add_food_item(
-            user_id,
-            application_id,
-            user_message_id,
-            item.name,
-            item.quantity,
-            item.unit,
-            item.total_calories,
-            item.meal_type
-        )
-    return {"user_message_id": user_message_id, "assistant_message_id": assistant_message_id}
+    if response.food_items:
+        for item in response.food_items:
+            add_food_item(
+                user_id,
+                application_id,
+                item.name,
+                item.quantity,
+                item.unit,
+                item.total_calories,
+                item.meal_type
+            )
+    # We don't return message IDs anymore as history is handled by LangChain
+    return {}
 
 def log_to_db(prompt, response):
     db.insert("log", {"prompt": prompt, "response": response})
@@ -283,7 +300,7 @@ def clean_log():
     db.query("DELETE FROM log WHERE id NOT IN (SELECT id FROM log ORDER BY id DESC LIMIT 10)",())
 
 
-def format_response(response: FullResponse) -> str:
+def format_response(response: Union[FullResponse, LLMResponseText]) -> str:
     """Format the response into a markdown table and message.
     
     Args:
@@ -292,11 +309,12 @@ def format_response(response: FullResponse) -> str:
     Returns:
         A formatted string containing the response
     """
-    if response.error_message:
+    if hasattr(response, 'error_message') and response.error_message:
         return response.error_message
 
     message = ""
-    if response.food_items:
+    # Check if food_items exists and is not None
+    if hasattr(response, 'food_items') and response.food_items:
         # Create a markdown table for the food items
         table = "| Food Item | Quantity | Unit | Calories | Meal Type |\n"
         table += "|-----------|----------|------|----------|------------|\n"
@@ -304,79 +322,84 @@ def format_response(response: FullResponse) -> str:
             table += f"| {item.name} | {item.quantity} | {item.unit} | {item.total_calories} | {item.meal_type} |\n"
         message = f"{table}\n\n"
     
-    message += response.response
+    # Check if response attribute exists and is not None
+    if hasattr(response, 'response') and response.response:
+        message += response.response
+        
+    # If no structured response elements found, return a default message or handle raw content if needed
+    if not message:
+         # If response itself might be a string (fallback, shouldn't happen with parser)
+         if isinstance(response, str):
+              return response 
+         return "Got it!" # Default if no text response and no food items
+         
     return message
 
-def process_user_message(content, foods_from_picture_json, user_id, application_id) -> FullResponse:  
-    """Process the user's message and return a response.
-    
-    Args:
-        content: The user's message
-        user_id: The ID of the user
-        application_id: The ID of the application
+def process_user_message(user_id: str, application_id: str, message: str) -> str:
+    """Process a user message using LangChain Runnables with history and return a formatted response string."""
+    try:
+        # 1. Initialize memory manager
+        memory_manager = DietMemory(user_id, application_id)
+        session_id = memory_manager.session_id
         
-    Returns:
-        A FullResponse object containing either:
-        - The assistant's response and food items on success
-        - An error message if processing failed
-    """
-    
-    MAX_RETRIES = 3
-    user = db.query_one("SELECT dietary_restrictions, calorie_goal_per_day FROM users WHERE id = ?", (user_id,))
-    restrictions = user.get("dietary_restrictions", "")
-    goal = user.get("calorie_goal_per_day", 2000)
-
-    today = datetime.now(UTC).date().isoformat()
-    result = db.query_one("""
-        SELECT SUM(calories) AS total FROM meal_entries
-        WHERE user_id = ? AND application_id = ? AND strftime('%Y-%m-%d', timestamp) = ?
-    """, (user_id, application_id, today))
-    consumed_calories = result['total'] or 0
-
-    recent = get_recent_chat(user_id, application_id)
-    chat_history = build_chat_history_block(recent)
-    schema = json.dumps(LLMResponseText.model_json_schema(), indent=2)
-    foods_consumed = get_meal_info(user_id, application_id)
-    foods_consumed = json.dumps(foods_consumed, indent=2)
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        prompt = get_text_prompt(content, restrictions, goal, consumed_calories, 
-                                 chat_history, schema, foods_consumed, foods_from_picture_json)
- 
-        response = openai_client.chat.completions.create(
-            model = "gpt-4.1-mini",
-            messages=[{
-                "role": "user",
-                "content": prompt
-            }],
-            temperature=0.7
+        # 2. Define the chain with history
+        # Remove the parser from the base chain; parsing will happen *after* invocation
+        base_chain = text_prompt_template | chat_model # | response_parser (removed)
+        
+        chain_with_history = RunnableWithMessageHistory(
+            base_chain,
+            lambda sid: memory_manager.get_message_history(), # Factory function for history
+            input_messages_key="input",         # Matches "{input}" in the human template
+            history_messages_key="chat_history", # Matches MessagesPlaceholder variable_name
+            # output_messages_key="output" # Output is now AIMessage, handled by default
         )
- 
-        json_response = response.to_json()
-        log_to_db(prompt, json_response)
+        
+        # 3. Gather context for the prompt
+        # TODO: Implement fetching user restrictions if needed by the prompt
+        restrictions = "None" # Placeholder
+        summary = get_calorie_summary(user_id, application_id)
+        foods_consumed_list = get_meal_info(user_id, application_id)
+        foods_consumed_str = "\n".join([f"- {f['food_name']} ({f['calories']} kcal)" for f in foods_consumed_list]) or "None logged yet today."
 
-        raw = response.choices[0].message.content
-        json_text = extract_json_block(raw)
+        # 4. Prepare input dictionary (still need format instructions for the LLM)
+        invoke_input = {
+            "input": message,
+            "format_instructions": response_parser.get_format_instructions(),
+            "foods_consumed": foods_consumed_str,
+            "restrictions": restrictions, 
+            "goal": summary['daily_goal'],
+            "consumed_calories": summary['total_calories_today']
+        }
 
+        # 5. Prepare config for session management
+        config = {"configurable": {"session_id": session_id}}
+
+        # 6. Invoke the chain - Result is now AIMessage
+        ai_message_result = chain_with_history.invoke(invoke_input, config=config)
+        
+        # 7. Manually parse the AI message content
         try:
-            parsed = json.loads(json_text)
-            validated = LLMResponseText(**parsed)
-            ids = store_interaction(user_id, application_id, content, validated)
-            return FullResponse(
-                user_message_id=ids["user_message_id"],
-                assistant_message_id=ids["assistant_message_id"],
-                **validated.model_dump()
-            )
-        except (json.JSONDecodeError, ValidationError) as e:
-            content += f"\n\nThe last response could not be parsed due to this error:\n{str(e)}"
-            if attempt == MAX_RETRIES:
-                return FullResponse(
-                    error_message="I'm having trouble understanding that. Please rephrase.",
-                    food_items=[],
-                    user_message_id=None,
-                    assistant_message_id=None
-                )
- 
+            # The LLM should return JSON matching the format instructions
+            parsed_response: LLMResponseText = response_parser.parse(ai_message_result.content)
+        except Exception as parse_error: # Catch JSONDecodeError, ValidationError, etc.
+            logger.error(f"Failed to parse LLM response: {parse_error}\nRaw content: {ai_message_result.content}", exc_info=True)
+            # Fallback: Create a simple response indicating the parsing failure
+            parsed_response = LLMResponseText(
+                food_items=[], 
+                response=f"I received a response, but had trouble understanding the format: {ai_message_result.content}"
+            ) 
+        
+        # 8. Store extracted food items (if any)
+        # Ensure store_interaction can handle potentially empty food_items from fallback
+        store_interaction(user_id, application_id, parsed_response) 
+        
+        # 9. Format and return the response for display
+        return format_response(parsed_response)
+        
+    except Exception as e:
+        logger.error(f"Error processing message: {str(e)}", exc_info=True) # Log traceback
+        return "I apologize, but I encountered an error while processing your message. Please try again."
+
 def process_image(image_path: str) -> FullResponse:
     """Process an image using ChatGPT's vision capabilities to identify its contents.
     
@@ -450,31 +473,9 @@ def process_image(image_path: str) -> FullResponse:
             "notes": "Failed to process image"
         }
 
-def add_message(user_id: str, application_id: str, content: str, role: str = "user") -> int:
-    """Add a message to the messages table and return its ID.
-    
-    Args:
-        user_id (str): The ID of the user sending the message
-        application_id (str): The ID of the application
-        content (str): The content of the message
-        role (str): The role of the message sender (default: "user")
-    
-    Returns:
-        int: The ID of the newly inserted message
-    """
-    conn = db.get_connection()
-    with conn:
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT INTO messages (user_id, application_id, content, role, timestamp) VALUES (?, ?, ?, ?, ?)",
-            (user_id, application_id, content, role, datetime.now(UTC).isoformat())
-        )
-        return cursor.lastrowid
- 
 def add_food_item(
     user_id: str,
     application_id: str,
-    message_id: int,
     name: str,
     quantity: float,
     unit: str,
@@ -486,7 +487,6 @@ def add_food_item(
     Args:
         user_id: The ID of the user
         application_id: The ID of the application
-        message_id: The ID of the message
         name: Name of the food item
         quantity: Amount of food
         unit: Unit of measurement
@@ -496,13 +496,14 @@ def add_food_item(
     Returns:
         The ID of the newly inserted food item
     """
-    with db._conn:
-        cursor = db._conn.cursor()
+    conn = db.get_connection()
+    with conn:
+        cursor = conn.cursor()
         cursor.execute(
-            "INSERT INTO meal_entries \
-            (user_id, application_id, message_id, food_name, quantity, unit, calories, meal_type, timestamp) VALUES \
-            (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, application_id, message_id, name, quantity, unit, total_calories, meal_type, datetime.now(UTC).isoformat())
+            "INSERT INTO meal_entries "
+            "(user_id, application_id, food_name, quantity, unit, calories, meal_type, timestamp) VALUES " 
+            "(?, ?, ?, ?, ?, ?, ?, ?)", 
+            (user_id, application_id, name, quantity, unit, total_calories, meal_type, datetime.now(UTC).isoformat())
         )
         return cursor.lastrowid
  
@@ -560,13 +561,18 @@ def get_meal_info(user_id: str, application_id: str) -> list:
 def test(p:list):
     if "one" in p:
         message = "6 slices of bacon for breakfast and 2 sunny side eggs.  one cup of coffee with cream."
-        responseObject =  process_user_message(message, "1", "1") 
+        # Call the updated process_user_message
+        responseString = process_user_message("1", "1", message)
+        print(f"Formatted Response:\n{responseString}")
  
     if "two" in p:
-         message_id = add_message("1", "1", "test", "assistant")
+         # add_food_item is now called within store_interaction
+         print("Skipping direct add_food_item call in test.")
+         # message_id = add_food_item("1", "1", None, "test", 0, "", 0, "unspecified")
 
-    if("print" in p):
-        print(json.dumps(responseObject.model_dump(), indent=2 ))
+    # if("print" in p): # Printing happens within the "one" block now
+    #     print(json.dumps(responseObject.model_dump(), indent=2 ))
 
 if __name__ == "__main__":
-    test(["one", "print"])
+    # test(["one", "print"]) # "print" part is implicit now
+    test(["one"])
