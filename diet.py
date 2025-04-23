@@ -12,7 +12,9 @@ from langchain_openai import ChatOpenAI
 from langchain.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain.output_parsers import PydanticOutputParser
 from langchain_core.runnables.history import RunnableWithMessageHistory
+from langchain.agents import AgentExecutor, create_openai_tools_agent
 from memory import DietMemory
+from app_tools import update_daily_calorie_limit
 import logging
 
 load_dotenv()
@@ -61,6 +63,9 @@ chat_model = ChatOpenAI(
     temperature=0.7
 )
 
+# Define the tools the agent can use
+tools = [update_daily_calorie_limit]
+
 # Create output parser for our LLMResponseText model
 response_parser = PydanticOutputParser(pydantic_object=LLMResponseText)
 
@@ -98,11 +103,13 @@ text_prompt_template = ChatPromptTemplate.from_messages([
 
     ### 👤 User Profile
     <user_information>
+        <user_id>{user_id}</user_id>
         <restrictions>{restrictions}</restrictions>
         <daily_calorie_goal>{goal}</daily_calorie_goal>
         <calories_already_consumed_today>{consumed_calories}</calories_already_consumed_today>
     </user_information>
-    """)
+    """),
+    MessagesPlaceholder(variable_name="agent_scratchpad")
 ])
 
 # --- Database Implementation for SQLite ---
@@ -191,83 +198,7 @@ Return **only** a JSON object that matches the following schema, enclosed in tri
 {schema}
 </schema>
 """
-
-def get_text_prompt(content, restrictions, goal, consumed_calories, 
-                    chat_history, schema, foods_consumed, foods_from_picture_json):
-    
-    if foods_from_picture_json:
-        foods_from_picture_prompt_part = f"""
-        ### 🍽️ Foods from Picture
-        <foods_from_picture>
-        {foods_from_picture_json}
-        </foods_from_picture>
-        """
-        foods_from_picture_rule_part = "7. include foods_from_picture in your processing.  \
-            these were provided in a picture that was analized in a previous steop."
-    else:
-        foods_from_picture_prompt_part = ""
-        foods_from_picture_rule_part = ""
-
-    return f"""
-You are a helpful dietary assistant integrated into a chatbot on a website. Your role is to track the user's food intake and ensure they stay on target to meet their daily calorie goal.
-
-You will receive a message from the user. This message may:
-- Mention food they've eaten.
-- Ask to adjust calories consumed (e.g., to correct an earlier entry).
-- Include conversational elements or questions.
-
-Your tasks:
-1. If the message contains food items, extract them and return a JSON object describing each one.
-2. If the message is an adjustment, return a food item with **negative calories** to reflect the correction.
-3. Respond with a conversational reply **only if appropriate**, but keep it minimal or omit it entirely if the message is strictly functional.
-4. If you see a trend in the eating that could be a problem, respond with a subtile warning and add some humor if possible.
-5. Use **a few well-placed emojis** to make the response friendly and engaging — but keep it subtle.
-6. If the user is eating a lot of calories, ask them what is going on.  Are they not sleeping?  Under a lot of stress? Change in medication? If they provide a resson, let them know you recored it and will look for a trend on the montly review. 
-{foods_from_picture_rule_part}
-
----
-
-### 📜 Recent Chat History
-<transcript>
-{chat_history}
-</transcript>
-
-
-### Foods Already Consumed Today
-<foods_already_consumed>
-{foods_consumed}
-</foods_already_consumed>
-
-
-### 💬 Latest Message from the User
-<latest_message>
-{content}
-</latest_message>
-
-{foods_from_picture_prompt_part}
-
-### 👤 User Profile
-<user_information>
-    <restrictions>{restrictions}</restrictions>
-    <daily_calorie_goal>{goal}</daily_calorie_goal>
-    <calories_already_consumed_today>{consumed_calories}</calories_already_consumed_today>
-</user_information>
-
----
-
-### 🧾 Response Format
-
-Return **only** a JSON object that matches the following schema, enclosed in triple backticks:
-
-```{{ your JSON here }}```
-
-### JSON Schema
-<schema>
-{schema}
-</schema>
-"""
-
-
+ 
 def store_interaction(user_id: str, application_id: str, response: LLMResponseText) -> dict:
     """Store the user interaction and any food items in the database.
     
@@ -336,69 +267,81 @@ def format_response(response: Union[FullResponse, LLMResponseText]) -> str:
     return message
 
 def process_user_message(user_id: str, application_id: str, message: str) -> str:
-    """Process a user message using LangChain Runnables with history and return a formatted response string."""
+    """Process a user message using a LangChain Agent with history and return a formatted response string."""
     try:
         # 1. Initialize memory manager
         memory_manager = DietMemory(user_id, application_id)
         session_id = memory_manager.session_id
         
-        # 2. Define the chain with history
-        # Remove the parser from the base chain; parsing will happen *after* invocation
-        base_chain = text_prompt_template | chat_model # | response_parser (removed)
-        
-        chain_with_history = RunnableWithMessageHistory(
-            base_chain,
-            lambda sid: memory_manager.get_message_history(), # Factory function for history
-            input_messages_key="input",         # Matches "{input}" in the human template
-            history_messages_key="chat_history", # Matches MessagesPlaceholder variable_name
-            # output_messages_key="output" # Output is now AIMessage, handled by default
+        # 2. Create the Agent
+        # Ensure the prompt has the required input variables: input, chat_history, agent_scratchpad
+        # Add agent_scratchpad placeholder if not present (create_openai_tools_agent adds it implicitly usually)
+        # If text_prompt_template needs adjustment, it would happen here. Assuming it's okay for now.
+        agent = create_openai_tools_agent(chat_model, tools, text_prompt_template)
+
+        # 3. Create the Agent Executor
+        agent_executor = AgentExecutor(agent=agent, tools=tools, verbose=True) # Added verbose=True for debugging
+
+        # 4. Wrap the executor with history management
+        agent_with_history = RunnableWithMessageHistory(
+            agent_executor,
+            lambda sid: memory_manager.get_message_history(),
+            input_messages_key="input",
+            history_messages_key="chat_history",
+            # AgentExecutor output includes 'output' key for final response
+            # Ensure memory handles agent's intermediate steps if necessary (DietMemory might need update later)
         )
         
-        # 3. Gather context for the prompt
-        # TODO: Implement fetching user restrictions if needed by the prompt
+        # 5. Gather context for the prompt
         restrictions = "None" # Placeholder
         summary = get_calorie_summary(user_id, application_id)
         foods_consumed_list = get_meal_info(user_id, application_id)
         foods_consumed_str = "\n".join([f"- {f['food_name']} ({f['calories']} kcal)" for f in foods_consumed_list]) or "None logged yet today."
 
-        # 4. Prepare input dictionary (still need format instructions for the LLM)
+        # 6. Prepare input dictionary (agent needs 'input' and 'chat_history' primarily)
+        # Format instructions are less critical here as agent handles JSON output/tool format
         invoke_input = {
             "input": message,
-            "format_instructions": response_parser.get_format_instructions(),
+            # Pass other template variables expected by the prompt directly
+            "format_instructions": response_parser.get_format_instructions(), # Still needed for the prompt template? Maybe not for agent. Let's keep it for now.
             "foods_consumed": foods_consumed_str,
             "restrictions": restrictions, 
             "goal": summary['daily_goal'],
-            "consumed_calories": summary['total_calories_today']
+            "consumed_calories": summary['total_calories_today'],
+            "user_id": user_id
         }
 
-        # 5. Prepare config for session management
+        # 7. Prepare config for session management
         config = {"configurable": {"session_id": session_id}}
 
-        # 6. Invoke the chain - Result is now AIMessage
-        ai_message_result = chain_with_history.invoke(invoke_input, config=config)
+        # 8. Invoke the agent with history
+        # The result is a dictionary, typically {'input': ..., 'chat_history': ..., 'output': 'Final response text'}
+        agent_result = agent_with_history.invoke(invoke_input, config=config)
         
-        # 7. Manually parse the AI message content
-        try:
-            # The LLM should return JSON matching the format instructions
-            parsed_response: LLMResponseText = response_parser.parse(ai_message_result.content)
-        except Exception as parse_error: # Catch JSONDecodeError, ValidationError, etc.
-            logger.error(f"Failed to parse LLM response: {parse_error}\nRaw content: {ai_message_result.content}", exc_info=True)
-            # Fallback: Create a simple response indicating the parsing failure
-            parsed_response = LLMResponseText(
-                food_items=[], 
-                response=f"I received a response, but had trouble understanding the format: {ai_message_result.content}"
-            ) 
+        # 9. Extract the final response from the agent's output
+        final_response_text = agent_result.get('output', "Sorry, I couldn't generate a response.")
+
+        # --- Parsing & Storing Logic (Needs Adjustment) ---
+        # The agent's final 'output' is usually just the text response.
+        # Extracting structured FoodItems after the agent runs requires a different approach.
+        # Option 1: Parse the final_response_text itself (less reliable).
+        # Option 2: Modify the agent/prompt to *always* return the structured JSON in the 'output'.
+        # Option 3: Use the tool outputs recorded by the AgentExecutor (if food logging becomes a tool).
         
-        # 8. Store extracted food items (if any)
-        # Ensure store_interaction can handle potentially empty food_items from fallback
-        store_interaction(user_id, application_id, parsed_response) 
+        # For now, let's skip the structured parsing and storing from the agent's text output.
+        # We need to decide how food logging integrates with the agent (is it a separate tool?)
+        # TODO: Re-evaluate food item parsing and storage with the agent setup.
         
-        # 9. Format and return the response for display
-        return format_response(parsed_response)
+        # logger.info(f"Agent raw result: {agent_result}") # Optional logging
         
+        # 10. Return the formatted text response
+        # Use a simpler formatting for now, just returning the text
+        # return format_response(parsed_response) # Old formatting based on parsing
+        return final_response_text # Return the direct agent output for now
+
     except Exception as e:
-        logger.error(f"Error processing message: {str(e)}", exc_info=True) # Log traceback
-        return "I apologize, but I encountered an error while processing your message. Please try again."
+        logger.error(f"Error processing message with agent: {str(e)}", exc_info=True) # Log traceback
+        return "I apologize, but I encountered an error while processing your message with the agent. Please try again."
 
 def process_image(image_path: str) -> FullResponse:
     """Process an image using ChatGPT's vision capabilities to identify its contents.
@@ -569,7 +512,8 @@ def test(p:list):
          # add_food_item is now called within store_interaction
          print("Skipping direct add_food_item call in test.")
          # message_id = add_food_item("1", "1", None, "test", 0, "", 0, "unspecified")
-
+ 
+        
     # if("print" in p): # Printing happens within the "one" block now
     #     print(json.dumps(responseObject.model_dump(), indent=2 ))
 
